@@ -73,9 +73,29 @@ object FormatUtils {
         }
     }
 
+    // Android's built-in MimeTypeMap doesn't know several common archive/media extensions
+    // (rar, 7z, apk on some OEM builds...). Apps like zArchiver register their intent
+    // filters against these exact mime types, not against "application/octet-stream" - so
+    // an unresolved extension silently falling back to octet-stream is why "no suitable
+    // app found" shows up for files a real archive manager can open just fine.
+    private val extraMimeTypes = mapOf(
+        "rar" to "application/vnd.rar",
+        "7z" to "application/x-7z-compressed",
+        "tar" to "application/x-tar",
+        "gz" to "application/gzip",
+        "bz2" to "application/x-bzip2",
+        "iso" to "application/x-iso9660-image",
+        "apk" to "application/vnd.android.package-archive",
+        "xapk" to "application/vnd.android.package-archive",
+        "flac" to "audio/flac",
+        "epub" to "application/epub+zip"
+    )
+
     fun getMimeType(file: File): String {
         val extension = file.extension.lowercase(Locale.ROOT)
-        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "application/octet-stream"
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+            ?: extraMimeTypes[extension]
+            ?: "application/octet-stream"
     }
 
     fun openDownloadedFile(context: Context, filePath: String): Boolean {
