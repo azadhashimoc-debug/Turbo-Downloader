@@ -218,9 +218,10 @@ class DownloadEngine(
         }
     }
 
+    /** Removes the small per-segment resume-progress marker files (see [executeMultiStreamDownload]). */
     private fun cleanPartFiles(file: File) {
         val parent = file.parentFile ?: return
-        val prefix = file.name + ".part"
+        val prefix = file.name + ".progress"
         parent.listFiles()?.forEach { f ->
             if (f.name.startsWith(prefix)) {
                 f.delete()
@@ -395,10 +396,11 @@ class DownloadEngine(
         )
 
         val totalDownloadedCounter = AtomicLong(0L)
-        // Check existing progress in parts
+        // Each segment's progress is tracked in a tiny marker file (just an 8-byte long),
+        // not a full copy of the downloaded bytes - the segment writes straight into
+        // targetFile at its own offset, so there is nothing left to merge afterwards.
         val partProgress = Array(numThreads) { index ->
-            val partFile = File(targetFile.parentFile, "${targetFile.name}.part$index")
-            val len = if (partFile.exists()) partFile.length() else 0L
+            val len = readSegmentProgress(targetFile, index)
             totalDownloadedCounter.addAndGet(len)
             AtomicLong(len)
         }
@@ -410,7 +412,8 @@ class DownloadEngine(
 
         val threadJobs = (0 until numThreads).map { index ->
             async(Dispatchers.IO) {
-                val startByte = index * chunkSize + partProgress[index].get()
+                val chunkStart = index * chunkSize
+                val startByte = chunkStart + partProgress[index].get()
                 val endByte = if (index == numThreads - 1) totalBytes - 1 else (index + 1) * chunkSize - 1
 
                 if (startByte > endByte) {
@@ -420,37 +423,38 @@ class DownloadEngine(
                 // Resilient download loop for this segment with up to 5 auto-retries on connection drops
                 var segmentCurrent = startByte
                 var retryCount = 0
-                val partFile = File(targetFile.parentFile, "${targetFile.name}.part$index")
 
-                while (segmentCurrent <= endByte && !pausedFlags.getOrDefault(downloadId, false)) {
-                    try {
-                        val request = Request.Builder()
-                            .url(initialEntity.url)
-                            .header("User-Agent", "Mozilla/5.0 (Android; DownloadManager/2.0 Turbo)")
-                            .header("Range", "bytes=$segmentCurrent-$endByte")
-                            .build()
+                // One RandomAccessFile per thread, seeked to this segment's offset - each
+                // thread only ever touches its own byte range, so concurrent writes are safe.
+                RandomAccessFile(targetFile, "rw").use { raf ->
+                    while (segmentCurrent <= endByte && !pausedFlags.getOrDefault(downloadId, false)) {
+                        try {
+                            val request = Request.Builder()
+                                .url(initialEntity.url)
+                                .header("User-Agent", "Mozilla/5.0 (Android; DownloadManager/2.0 Turbo)")
+                                .header("Range", "bytes=$segmentCurrent-$endByte")
+                                .build()
 
-                        val response = okHttpClient.newCall(request).execute()
-                        if (!response.isSuccessful && response.code != 206) {
-                            response.close()
-                            throw Exception("HTTP chunk error ${response.code}")
-                        }
+                            val response = okHttpClient.newCall(request).execute()
+                            if (!response.isSuccessful && response.code != 206) {
+                                response.close()
+                                throw Exception("HTTP chunk error ${response.code}")
+                            }
 
-                        val body = response.body ?: throw Exception("Chunk body null")
-                        val bufferSize = calculateOptimalBuffer(currentSpeed)
-                        val buffer = ByteArray(bufferSize)
-                        val input = body.byteStream()
+                            val body = response.body ?: throw Exception("Chunk body null")
+                            val bufferSize = calculateOptimalBuffer(currentSpeed)
+                            val buffer = ByteArray(bufferSize)
 
-                        FileOutputStream(partFile, true).use { fos ->
-                            input.use { stream ->
+                            raf.seek(segmentCurrent)
+                            body.byteStream().use { stream ->
                                 var read: Int
                                 while (stream.read(buffer).also { read = it } != -1) {
                                     if (pausedFlags.getOrDefault(downloadId, false)) {
                                         break
                                     }
-                                    fos.write(buffer, 0, read)
+                                    raf.write(buffer, 0, read)
                                     segmentCurrent += read
-                                    partProgress[index].addAndGet(read.toLong())
+                                    val segmentDone = partProgress[index].addAndGet(read.toLong())
                                     val downloadedNow = totalDownloadedCounter.addAndGet(read.toLong())
                                     bytesSinceLastSpeed += read
 
@@ -467,6 +471,7 @@ class DownloadEngine(
                                     }
 
                                     if (now - lastDbUpdateTime >= 500) {
+                                        writeSegmentProgress(targetFile, index, segmentDone)
                                         downloadDao.updateDownload(
                                             initialEntity.copy(
                                                 downloadedBytes = downloadedNow.coerceAtMost(totalBytes),
@@ -478,17 +483,17 @@ class DownloadEngine(
                                         lastDbUpdateTime = now
                                     }
                                 }
-                                fos.flush()
                             }
+                            writeSegmentProgress(targetFile, index, partProgress[index].get())
+                            retryCount = 0 // Successfully finished or paused
+                        } catch (e: Exception) {
+                            if (pausedFlags.getOrDefault(downloadId, false)) break
+                            retryCount++
+                            if (retryCount > 5) {
+                                throw e
+                            }
+                            delay(1000L * retryCount) // Smart exponential backoff on weak link
                         }
-                        retryCount = 0 // Successfully finished or paused
-                    } catch (e: Exception) {
-                        if (pausedFlags.getOrDefault(downloadId, false)) break
-                        retryCount++
-                        if (retryCount > 5) {
-                            throw e
-                        }
-                        delay(1000L * retryCount) // Smart exponential backoff on weak link
                     }
                 }
             }
@@ -508,24 +513,8 @@ class DownloadEngine(
             return@withContext
         }
 
-        // Merge all parts into final target file using RandomAccessFile
-        RandomAccessFile(targetFile, "rw").use { raf ->
-            for (i in 0 until numThreads) {
-                val partFile = File(targetFile.parentFile, "${targetFile.name}.part$i")
-                if (partFile.exists()) {
-                    val offset = i * chunkSize
-                    raf.seek(offset)
-                    partFile.inputStream().use { partIn ->
-                        val mergeBuffer = ByteArray(64 * 1024)
-                        var bytes: Int
-                        while (partIn.read(mergeBuffer).also { bytes = it } != -1) {
-                            raf.write(mergeBuffer, 0, bytes)
-                        }
-                    }
-                    partFile.delete()
-                }
-            }
-        }
+        // Nothing to merge - every segment already wrote directly into targetFile.
+        cleanPartFiles(targetFile)
 
         downloadDao.updateDownload(
             initialEntity.copy(
@@ -536,6 +525,27 @@ class DownloadEngine(
                 dateCompleted = System.currentTimeMillis()
             )
         )
+    }
+
+    private fun segmentProgressFile(targetFile: File, index: Int): File =
+        File(targetFile.parentFile, "${targetFile.name}.progress$index")
+
+    private fun readSegmentProgress(targetFile: File, index: Int): Long {
+        val file = segmentProgressFile(targetFile, index)
+        if (!file.exists()) return 0L
+        return try {
+            RandomAccessFile(file, "r").use { it.readLong() }
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    private fun writeSegmentProgress(targetFile: File, index: Int, bytesDone: Long) {
+        try {
+            RandomAccessFile(segmentProgressFile(targetFile, index), "rw").use { it.writeLong(bytesDone) }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
     /**
