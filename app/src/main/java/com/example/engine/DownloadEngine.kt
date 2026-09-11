@@ -6,7 +6,9 @@ import com.example.data.db.DownloadDao
 import com.example.data.model.DownloadCategory
 import com.example.data.model.DownloadEntity
 import com.example.data.model.DownloadStatus
+import com.example.service.DownloadKeepAliveService
 import com.example.util.FormatUtils
+import com.example.util.NotificationHelper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -65,23 +67,120 @@ class DownloadEngine(
     val liveSpeeds: StateFlow<Map<Long, Long>> = _liveSpeeds.asStateFlow()
 
     init {
-        // Reset any leftover "DOWNLOADING" states from previous app session
+        NotificationHelper.ensureChannels(context)
+        // Reset any leftover "DOWNLOADING"/"CONNECTING" states from a previous app session
+        // that was killed mid-download - otherwise those items would stay stuck showing a
+        // spinner forever, with no coroutine left running to ever finish them.
         engineScope.launch {
-            downloadDao.resetInterruptedDownloads()
+            downloadDao.resetInterruptedDownloads(
+                oldStatus = DownloadStatus.DOWNLOADING,
+                newStatus = DownloadStatus.PAUSED
+            )
+            downloadDao.resetInterruptedDownloads(
+                oldStatus = DownloadStatus.CONNECTING,
+                newStatus = DownloadStatus.PAUSED
+            )
         }
+    }
+
+    /**
+     * Keeps the persistent "downloads in progress" notification (and the foreground
+     * service backing it) in sync with how many jobs are actually running, so the
+     * process is protected from being killed while a download is active.
+     */
+    private fun refreshKeepAliveState() {
+        val activeCount = activeJobs.size
+        val totalSpeed = _liveSpeeds.value.values.sum()
+        DownloadKeepAliveService.updateState(context, activeCount, totalSpeed)
     }
 
     fun setEngineMode(mode: SmartEngineMode) {
         _engineMode.value = mode
     }
 
+    /**
+     * Moves an already-completed download out of this app's hidden sandbox folder into the
+     * public Downloads/TurboLoad folder, so other apps (archive managers, file browsers) can
+     * finally see it - without re-downloading it. Only this app can reach its own sandbox
+     * folder, so this has to happen from inside it. Same-volume moves are an instant rename,
+     * not a byte-for-byte copy, so this is safe even for very large files.
+     */
+    fun moveToPublicStorage(downloadId: Long, onResult: (Boolean) -> Unit = {}) {
+        engineScope.launch {
+            if (!hasAllFilesAccess()) {
+                onResult(false)
+                return@launch
+            }
+            val item = downloadDao.getDownloadByIdSync(downloadId)
+            if (item == null || item.status != DownloadStatus.COMPLETED) {
+                onResult(false)
+                return@launch
+            }
+            val source = File(item.filePath)
+            if (!source.exists()) {
+                onResult(false)
+                return@launch
+            }
+
+            val publicDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "TurboLoad")
+            if (!publicDir.exists()) publicDir.mkdirs()
+
+            if (source.parentFile?.absolutePath == publicDir.absolutePath) {
+                onResult(true) // Already there
+                return@launch
+            }
+
+            val dest = getUniqueFile(publicDir, source.name)
+            val success = try {
+                if (source.renameTo(dest)) {
+                    true
+                } else {
+                    // Cross-filesystem fallback (e.g. source on an SD card): copy, then
+                    // delete the original once the copy is verified complete.
+                    source.copyTo(dest, overwrite = false)
+                    if (dest.length() == source.length()) {
+                        source.delete()
+                        true
+                    } else {
+                        dest.delete()
+                        false
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                false
+            }
+
+            if (success) {
+                downloadDao.updateDownload(item.copy(filePath = dest.absolutePath))
+            }
+            onResult(success)
+        }
+    }
+
+    /**
+     * When "All files access" has been granted, downloads go into the real, publicly
+     * browsable Downloads folder (visible to any file manager or archive app). Without it,
+     * fall back to this app's own sandboxed external-files dir, which - since Android 11 -
+     * no other app (zArchiver included) can browse into at all, even though the OS still
+     * lets us read/write it ourselves.
+     */
     private fun getDownloadsDirectory(): File {
-        val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-            ?: File(context.filesDir, "Downloads")
+        val dir = if (hasAllFilesAccess()) {
+            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "TurboLoad")
+        } else {
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                ?: File(context.filesDir, "Downloads")
+        }
         if (!dir.exists()) {
             dir.mkdirs()
         }
         return dir
+    }
+
+    private fun hasAllFilesAccess(): Boolean {
+        return android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R &&
+                Environment.isExternalStorageManager()
     }
 
     suspend fun enqueueDownload(
@@ -122,6 +221,7 @@ class DownloadEngine(
             runSmartDownload(downloadId)
         }
         activeJobs[downloadId] = job
+        refreshKeepAliveState()
     }
 
     fun pauseDownload(downloadId: Long) {
@@ -132,6 +232,7 @@ class DownloadEngine(
         val updatedMap = _liveSpeeds.value.toMutableMap()
         updatedMap.remove(downloadId)
         _liveSpeeds.value = updatedMap
+        refreshKeepAliveState()
 
         engineScope.launch {
             val item = downloadDao.getDownloadByIdSync(downloadId) ?: return@launch
@@ -148,6 +249,45 @@ class DownloadEngine(
 
     fun resumeDownload(downloadId: Long) {
         startDownload(downloadId)
+    }
+
+    /**
+     * Cancels an in-progress download but - unlike [cancelDownload] - keeps its row so it
+     * shows up as CANCELLED (retryable from the list), instead of vanishing entirely. This
+     * is what the UI's "cancel" (X) action on an active download actually calls; the trash
+     * icon on a finished/failed/cancelled item still uses [cancelDownload] to remove it
+     * for good.
+     */
+    fun cancelActiveDownload(downloadId: Long) {
+        pausedFlags[downloadId] = true
+        activeJobs[downloadId]?.cancel()
+        activeJobs.remove(downloadId)
+
+        val updatedMap = _liveSpeeds.value.toMutableMap()
+        updatedMap.remove(downloadId)
+        _liveSpeeds.value = updatedMap
+        refreshKeepAliveState()
+
+        engineScope.launch {
+            val item = downloadDao.getDownloadByIdSync(downloadId) ?: return@launch
+            if (item.status == DownloadStatus.COMPLETED) return@launch
+
+            try {
+                val file = File(item.filePath)
+                if (file.exists()) file.delete()
+                cleanPartFiles(file)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+
+            downloadDao.updateDownload(
+                item.copy(
+                    status = DownloadStatus.CANCELLED,
+                    downloadedBytes = 0L,
+                    speedBytesPerSec = 0
+                )
+            )
+        }
     }
 
     fun retryDownload(downloadId: Long) {
@@ -183,6 +323,7 @@ class DownloadEngine(
         val updatedMap = _liveSpeeds.value.toMutableMap()
         updatedMap.remove(downloadId)
         _liveSpeeds.value = updatedMap
+        refreshKeepAliveState()
 
         engineScope.launch {
             val item = downloadDao.getDownloadByIdSync(downloadId)
@@ -201,9 +342,16 @@ class DownloadEngine(
         }
     }
 
+    /**
+     * Each [SmartEngineMode] genuinely changes how the download runs, not just its label -
+     * see [SmartEngineMode.streamCount] for the canonical per-mode stream count.
+     */
+    private fun numThreadsForMode(mode: SmartEngineMode): Int = mode.streamCount
+
+    /** Removes the small per-segment resume-progress marker files (see [executeMultiStreamDownload]). */
     private fun cleanPartFiles(file: File) {
         val parent = file.parentFile ?: return
-        val prefix = file.name + ".part"
+        val prefix = file.name + ".progress"
         parent.listFiles()?.forEach { f ->
             if (f.name.startsWith(prefix)) {
                 f.delete()
@@ -287,13 +435,15 @@ class DownloadEngine(
                 }
             }
 
-            // Determine if multi-threaded chunking is beneficial
+            // Determine if multi-threaded chunking is beneficial, and how many streams
+            // this mode actually uses - each mode genuinely behaves differently now.
             val currentMode = _engineMode.value
+            val numThreads = numThreadsForMode(currentMode)
             val isLargeFile = probedContentLength > 2 * 1024 * 1024 // > 2MB
             val canUseMultiStream = isServerResumable &&
                     probedContentLength > 0 &&
                     isLargeFile &&
-                    currentMode == SmartEngineMode.TURBO_MULTI_STREAM
+                    numThreads > 1
 
             val finalFileName = probedFileName
             entity = entity.copy(
@@ -306,13 +456,17 @@ class DownloadEngine(
             downloadDao.updateDownload(entity)
 
             if (canUseMultiStream) {
-                // Turbo 4-stream segmented download for weak connections
-                executeMultiStreamDownload(downloadId, entity, targetFile, probedContentLength)
+                // Segmented download across `numThreads` parallel HTTP Range streams
+                executeMultiStreamDownload(downloadId, entity, targetFile, probedContentLength, numThreads, currentMode)
             } else {
                 // Adaptive single-stream with dynamic buffer and auto-reconnect
-                executeAdaptiveStreamDownload(downloadId, entity, targetFile, probedContentLength, isServerResumable)
+                executeAdaptiveStreamDownload(downloadId, entity, targetFile, probedContentLength, isServerResumable, currentMode)
             }
 
+            val finished = downloadDao.getDownloadByIdSync(downloadId)
+            if (finished != null && finished.status == DownloadStatus.COMPLETED) {
+                NotificationHelper.notifyCompleted(context, finished)
+            }
         } catch (e: CancellationException) {
             val current = downloadDao.getDownloadByIdSync(downloadId)
             if (current != null && current.status != DownloadStatus.COMPLETED) {
@@ -327,35 +481,37 @@ class DownloadEngine(
             e.printStackTrace()
             val current = downloadDao.getDownloadByIdSync(downloadId)
             if (current != null) {
-                downloadDao.updateDownload(
-                    current.copy(
-                        status = DownloadStatus.FAILED,
-                        errorMessage = e.localizedMessage ?: "Yükləmə xətası baş verdi",
-                        speedBytesPerSec = 0
-                    )
+                val failed = current.copy(
+                    status = DownloadStatus.FAILED,
+                    errorMessage = e.localizedMessage ?: "Yükləmə xətası baş verdi",
+                    speedBytesPerSec = 0
                 )
+                downloadDao.updateDownload(failed)
+                NotificationHelper.notifyFailed(context, failed)
             }
         } finally {
             activeJobs.remove(downloadId)
             val speedMap = _liveSpeeds.value.toMutableMap()
             speedMap.remove(downloadId)
             _liveSpeeds.value = speedMap
+            refreshKeepAliveState()
         }
     }
 
     /**
      * Smart Segmented Multi-Stream Downloader:
-     * Splits file into 4 parallel chunks. Weak and throttled connections benefit immensely
-     * because servers often throttle per-connection bandwidth, but 4 concurrent connections
-     * bypass single-stream limits and maximize link utilization.
+     * Splits the file into [numThreads] parallel chunks. Weak and throttled connections
+     * benefit immensely because servers often throttle per-connection bandwidth, but several
+     * concurrent connections bypass single-stream limits and maximize link utilization.
      */
     private suspend fun executeMultiStreamDownload(
         downloadId: Long,
         initialEntity: DownloadEntity,
         targetFile: File,
-        totalBytes: Long
+        totalBytes: Long,
+        numThreads: Int,
+        mode: SmartEngineMode
     ) = withContext(Dispatchers.IO) {
-        val numThreads = 4
         val chunkSize = totalBytes / numThreads
 
         // Allocate target file space if not already allocated
@@ -373,10 +529,11 @@ class DownloadEngine(
         )
 
         val totalDownloadedCounter = AtomicLong(0L)
-        // Check existing progress in parts
+        // Each segment's progress is tracked in a tiny marker file (just an 8-byte long),
+        // not a full copy of the downloaded bytes - the segment writes straight into
+        // targetFile at its own offset, so there is nothing left to merge afterwards.
         val partProgress = Array(numThreads) { index ->
-            val partFile = File(targetFile.parentFile, "${targetFile.name}.part$index")
-            val len = if (partFile.exists()) partFile.length() else 0L
+            val len = readSegmentProgress(targetFile, index)
             totalDownloadedCounter.addAndGet(len)
             AtomicLong(len)
         }
@@ -388,7 +545,8 @@ class DownloadEngine(
 
         val threadJobs = (0 until numThreads).map { index ->
             async(Dispatchers.IO) {
-                val startByte = index * chunkSize + partProgress[index].get()
+                val chunkStart = index * chunkSize
+                val startByte = chunkStart + partProgress[index].get()
                 val endByte = if (index == numThreads - 1) totalBytes - 1 else (index + 1) * chunkSize - 1
 
                 if (startByte > endByte) {
@@ -398,37 +556,38 @@ class DownloadEngine(
                 // Resilient download loop for this segment with up to 5 auto-retries on connection drops
                 var segmentCurrent = startByte
                 var retryCount = 0
-                val partFile = File(targetFile.parentFile, "${targetFile.name}.part$index")
 
-                while (segmentCurrent <= endByte && !pausedFlags.getOrDefault(downloadId, false)) {
-                    try {
-                        val request = Request.Builder()
-                            .url(initialEntity.url)
-                            .header("User-Agent", "Mozilla/5.0 (Android; DownloadManager/2.0 Turbo)")
-                            .header("Range", "bytes=$segmentCurrent-$endByte")
-                            .build()
+                // One RandomAccessFile per thread, seeked to this segment's offset - each
+                // thread only ever touches its own byte range, so concurrent writes are safe.
+                RandomAccessFile(targetFile, "rw").use { raf ->
+                    while (segmentCurrent <= endByte && !pausedFlags.getOrDefault(downloadId, false)) {
+                        try {
+                            val request = Request.Builder()
+                                .url(initialEntity.url)
+                                .header("User-Agent", "Mozilla/5.0 (Android; DownloadManager/2.0 Turbo)")
+                                .header("Range", "bytes=$segmentCurrent-$endByte")
+                                .build()
 
-                        val response = okHttpClient.newCall(request).execute()
-                        if (!response.isSuccessful && response.code != 206) {
-                            response.close()
-                            throw Exception("HTTP chunk error ${response.code}")
-                        }
+                            val response = okHttpClient.newCall(request).execute()
+                            if (!response.isSuccessful && response.code != 206) {
+                                response.close()
+                                throw Exception("HTTP chunk error ${response.code}")
+                            }
 
-                        val body = response.body ?: throw Exception("Chunk body null")
-                        val bufferSize = calculateOptimalBuffer(currentSpeed)
-                        val buffer = ByteArray(bufferSize)
-                        val input = body.byteStream()
+                            val body = response.body ?: throw Exception("Chunk body null")
+                            val bufferSize = calculateOptimalBuffer(currentSpeed, mode)
+                            val buffer = ByteArray(bufferSize)
 
-                        FileOutputStream(partFile, true).use { fos ->
-                            input.use { stream ->
+                            raf.seek(segmentCurrent)
+                            body.byteStream().use { stream ->
                                 var read: Int
                                 while (stream.read(buffer).also { read = it } != -1) {
                                     if (pausedFlags.getOrDefault(downloadId, false)) {
                                         break
                                     }
-                                    fos.write(buffer, 0, read)
+                                    raf.write(buffer, 0, read)
                                     segmentCurrent += read
-                                    partProgress[index].addAndGet(read.toLong())
+                                    val segmentDone = partProgress[index].addAndGet(read.toLong())
                                     val downloadedNow = totalDownloadedCounter.addAndGet(read.toLong())
                                     bytesSinceLastSpeed += read
 
@@ -445,6 +604,7 @@ class DownloadEngine(
                                     }
 
                                     if (now - lastDbUpdateTime >= 500) {
+                                        writeSegmentProgress(targetFile, index, segmentDone)
                                         downloadDao.updateDownload(
                                             initialEntity.copy(
                                                 downloadedBytes = downloadedNow.coerceAtMost(totalBytes),
@@ -456,17 +616,17 @@ class DownloadEngine(
                                         lastDbUpdateTime = now
                                     }
                                 }
-                                fos.flush()
                             }
+                            writeSegmentProgress(targetFile, index, partProgress[index].get())
+                            retryCount = 0 // Successfully finished or paused
+                        } catch (e: Exception) {
+                            if (pausedFlags.getOrDefault(downloadId, false)) break
+                            retryCount++
+                            if (retryCount > maxRetriesForMode(mode)) {
+                                throw e
+                            }
+                            delay(1000L * retryCount) // Smart exponential backoff on weak link
                         }
-                        retryCount = 0 // Successfully finished or paused
-                    } catch (e: Exception) {
-                        if (pausedFlags.getOrDefault(downloadId, false)) break
-                        retryCount++
-                        if (retryCount > 5) {
-                            throw e
-                        }
-                        delay(1000L * retryCount) // Smart exponential backoff on weak link
                     }
                 }
             }
@@ -486,24 +646,8 @@ class DownloadEngine(
             return@withContext
         }
 
-        // Merge all parts into final target file using RandomAccessFile
-        RandomAccessFile(targetFile, "rw").use { raf ->
-            for (i in 0 until numThreads) {
-                val partFile = File(targetFile.parentFile, "${targetFile.name}.part$i")
-                if (partFile.exists()) {
-                    val offset = i * chunkSize
-                    raf.seek(offset)
-                    partFile.inputStream().use { partIn ->
-                        val mergeBuffer = ByteArray(64 * 1024)
-                        var bytes: Int
-                        while (partIn.read(mergeBuffer).also { bytes = it } != -1) {
-                            raf.write(mergeBuffer, 0, bytes)
-                        }
-                    }
-                    partFile.delete()
-                }
-            }
-        }
+        // Nothing to merge - every segment already wrote directly into targetFile.
+        cleanPartFiles(targetFile)
 
         downloadDao.updateDownload(
             initialEntity.copy(
@@ -516,6 +660,27 @@ class DownloadEngine(
         )
     }
 
+    private fun segmentProgressFile(targetFile: File, index: Int): File =
+        File(targetFile.parentFile, "${targetFile.name}.progress$index")
+
+    private fun readSegmentProgress(targetFile: File, index: Int): Long {
+        val file = segmentProgressFile(targetFile, index)
+        if (!file.exists()) return 0L
+        return try {
+            RandomAccessFile(file, "r").use { it.readLong() }
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    private fun writeSegmentProgress(targetFile: File, index: Int, bytesDone: Long) {
+        try {
+            RandomAccessFile(segmentProgressFile(targetFile, index), "rw").use { it.writeLong(bytesDone) }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     /**
      * Adaptive single-stream with dynamic buffer scaling and persistent reconnect for servers
      * that don't support multi-range chunks.
@@ -525,7 +690,8 @@ class DownloadEngine(
         initialEntity: DownloadEntity,
         targetFile: File,
         totalBytes: Long,
-        isResumable: Boolean
+        isResumable: Boolean,
+        mode: SmartEngineMode
     ) = withContext(Dispatchers.IO) {
         var existingLength = if (targetFile.exists()) targetFile.length() else 0L
         var currentDownloaded = existingLength
@@ -568,7 +734,7 @@ class DownloadEngine(
                 val stream = body.byteStream()
                 val fos = FileOutputStream(targetFile, append)
 
-                val bufferSize = calculateOptimalBuffer(currentSpeed)
+                val bufferSize = calculateOptimalBuffer(currentSpeed, mode)
                 val buffer = ByteArray(bufferSize)
 
                 fos.use { output ->
@@ -617,7 +783,7 @@ class DownloadEngine(
             } catch (e: Exception) {
                 if (pausedFlags.getOrDefault(downloadId, false)) break
                 retryCount++
-                if (retryCount > 6) {
+                if (retryCount > maxRetriesForMode(mode)) {
                     throw e
                 }
                 delay(1200L * retryCount) // Smart auto-retry on weak internet connection drops
@@ -653,14 +819,30 @@ class DownloadEngine(
      * Slow networks (< 256 KB/s): 16 KB for low latency and rapid packet flushing
      * Medium networks: 32 KB - 64 KB
      * Fast networks: 128 KB for peak OS system call efficiency
+     *
+     * LOW_LATENCY_ECO caps the buffer at 32 KB regardless of measured speed - smaller
+     * writes flush to disk more often, so a connection that drops mid-buffer loses less
+     * progress, matching what that mode promises ("small buffers against interruption").
      */
-    private fun calculateOptimalBuffer(speedBytesPerSec: Long): Int {
-        return when {
+    private fun calculateOptimalBuffer(speedBytesPerSec: Long, mode: SmartEngineMode): Int {
+        val uncapped = when {
             speedBytesPerSec < 256 * 1024 -> 16 * 1024
             speedBytesPerSec < 1024 * 1024 -> 32 * 1024
             speedBytesPerSec < 5 * 1024 * 1024 -> 64 * 1024
             else -> 128 * 1024
         }
+        val cap = if (mode == SmartEngineMode.LOW_LATENCY_ECO) 32 * 1024 else Int.MAX_VALUE
+        return uncapped.coerceAtMost(cap)
+    }
+
+    /**
+     * LOW_LATENCY_ECO tolerates more consecutive drops before giving up, matching its
+     * "resilient against a flaky connection" description; the other modes fail a bit
+     * faster since they assume a more usable link.
+     */
+    private fun maxRetriesForMode(mode: SmartEngineMode): Int = when (mode) {
+        SmartEngineMode.LOW_LATENCY_ECO -> 10
+        else -> 6
     }
 
     private fun sanitizeFileName(name: String): String {

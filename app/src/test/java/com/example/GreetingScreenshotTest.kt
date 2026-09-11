@@ -2,6 +2,7 @@ package com.example
 
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onRoot
+import com.example.engine.SmartEngineMode
 import com.example.ui.theme.MyApplicationTheme
 import com.github.takahirom.roborazzi.RobolectricDeviceQualifiers
 import com.github.takahirom.roborazzi.captureRoboImage
@@ -14,7 +15,7 @@ import org.robolectric.annotation.GraphicsMode
 
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
-@Config(qualifiers = RobolectricDeviceQualifiers.Pixel8, sdk = [36])
+@Config(qualifiers = RobolectricDeviceQualifiers.Pixel8, sdk = [34]) // Robolectric has no API 36 framework jar yet
 class GreetingScreenshotTest {
 
   @get:Rule val composeTestRule = createComposeRule()
@@ -27,7 +28,8 @@ class GreetingScreenshotTest {
           totalSpeed = 2400000L,
           activeCount = 2,
           completedCount = 5,
-          freeStorage = "14.2 GB"
+          freeStorage = "14.2 GB",
+          engineMode = SmartEngineMode.TURBO_MULTI_STREAM
         )
       }
     }

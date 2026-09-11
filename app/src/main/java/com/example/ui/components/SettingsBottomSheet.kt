@@ -66,7 +66,9 @@ fun SettingsBottomSheet(
     currentEngineMode: SmartEngineMode,
     onEngineModeSelected: (SmartEngineMode) -> Unit,
     onDismiss: () -> Unit,
-    onClearCompleted: () -> Unit
+    onClearCompleted: () -> Unit,
+    hasAllFilesAccess: Boolean = false,
+    onRequestStorageAccess: () -> Unit = {}
 ) {
     val sheetState = rememberModalBottomSheetState()
     val scrollState = rememberScrollState()
@@ -220,14 +222,19 @@ fun SettingsBottomSheet(
             HorizontalDivider(color = ObsidianBorder)
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Card: Storage Info
+            // Card: Storage Info / All-files-access toggle
             Card(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = !hasAllFilesAccess) { onRequestStorageAccess() },
                 shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(
                     containerColor = ObsidianCard
                 ),
-                border = BorderStroke(1.dp, ObsidianBorder)
+                border = BorderStroke(
+                    1.dp,
+                    if (hasAllFilesAccess) NeonEmerald.copy(alpha = 0.35f) else ObsidianBorder
+                )
             ) {
                 Row(
                     modifier = Modifier
@@ -239,18 +246,18 @@ fun SettingsBottomSheet(
                         modifier = Modifier
                             .size(36.dp)
                             .clip(CircleShape)
-                            .background(ElectricCyan.copy(alpha = 0.15f)),
+                            .background((if (hasAllFilesAccess) NeonEmerald else ElectricCyan).copy(alpha = 0.15f)),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = Icons.Default.Folder,
                             contentDescription = null,
-                            tint = ElectricCyan,
+                            tint = if (hasAllFilesAccess) NeonEmerald else ElectricCyan,
                             modifier = Modifier.size(18.dp)
                         )
                     }
                     Spacer(modifier = Modifier.width(12.dp))
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "Faylların Saxlanma Yeri",
                             style = MaterialTheme.typography.titleMedium.copy(fontSize = 14.sp, fontWeight = FontWeight.Bold),
@@ -258,9 +265,13 @@ fun SettingsBottomSheet(
                         )
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = "Tətbiqin xüsusi 'Downloads' qovluğunda saxlanılır",
+                            text = if (hasAllFilesAccess) {
+                                "Downloads/TurboLoad qovluğunda saxlanılır - bütün proqramlar görə bilər"
+                            } else {
+                                "Tətbiqin gizli qovluğunda saxlanılır - digər proqramlar (zArchiver və s.) görə bilmir. Dəyişmək üçün toxunun."
+                            },
                             style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFF94A3B8)
+                            color = if (hasAllFilesAccess) NeonEmerald.copy(alpha = 0.85f) else Color(0xFF94A3B8)
                         )
                     }
                 }

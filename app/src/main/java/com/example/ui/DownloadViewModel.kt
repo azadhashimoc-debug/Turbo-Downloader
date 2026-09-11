@@ -246,6 +246,24 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
         repository.resumeDownload(id)
     }
 
+    fun cancelActiveDownload(id: Long) {
+        repository.cancelActiveDownload(id)
+        viewModelScope.launch {
+            _snackbarEvent.emit("Yükləmə ləğv edildi")
+        }
+    }
+
+    fun moveToPublicStorage(id: Long) {
+        repository.moveToPublicStorage(id) { success ->
+            viewModelScope.launch {
+                _snackbarEvent.emit(
+                    if (success) "Fayl Downloads/TurboLoad qovluğuna köçürüldü"
+                    else "Köçürmə uğursuz oldu - 'Bütün fayllara giriş' icazəsini yoxlayın"
+                )
+            }
+        }
+    }
+
     fun retryDownload(id: Long) {
         repository.retryDownload(id)
     }

@@ -96,11 +96,34 @@ import com.example.util.FormatUtils
 
 class MainActivity : ComponentActivity() {
 
+    companion object {
+        /**
+         * Public contract for another app you control (e.g. a custom browser) to hand off
+         * a download directly - no chooser dialog, no relying on the system intercepting a
+         * link the way Chrome never does. Send an explicit intent:
+         *
+         * ```
+         * Intent(ACTION_ADD_DOWNLOAD).apply {
+         *     setPackage("com.aistudio.downloadmanager.kxvt")
+         *     putExtra(EXTRA_URL, url)                 // required
+         *     putExtra(EXTRA_FILE_NAME, suggestedName)  // optional
+         * }.let(context::startActivity)
+         * ```
+         */
+        const val ACTION_ADD_DOWNLOAD = "com.aistudio.downloadmanager.kxvt.action.ADD_DOWNLOAD"
+        const val EXTRA_URL = "extra_url"
+        const val EXTRA_FILE_NAME = "extra_file_name"
+    }
+
     private val viewModel: DownloadViewModel by viewModels()
+
+    private val notificationPermissionLauncher =
+        registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        requestNotificationPermissionIfNeeded()
 
         // Handle Intent (View link / Share link)
         handleIncomingIntent(intent)
@@ -118,10 +141,29 @@ class MainActivity : ComponentActivity() {
         handleIncomingIntent(intent)
     }
 
+    private fun requestNotificationPermissionIfNeeded() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU) return
+        val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.POST_NOTIFICATIONS
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     private fun handleIncomingIntent(intent: Intent?) {
         if (intent == null) return
 
         when (intent.action) {
+            ACTION_ADD_DOWNLOAD -> {
+                val url = intent.getStringExtra(EXTRA_URL)?.trim()
+                if (!url.isNullOrBlank() && (url.startsWith("http://") || url.startsWith("https://"))) {
+                    val fileName = intent.getStringExtra(EXTRA_FILE_NAME)?.trim()
+                    // Trusted first-party caller - start immediately, no confirmation dialog.
+                    viewModel.startDownload(url, fileName)
+                }
+            }
             Intent.ACTION_VIEW -> {
                 val dataUri = intent.dataString
                 if (!dataUri.isNullOrBlank() && (dataUri.startsWith("http://") || dataUri.startsWith("https://"))) {
@@ -158,11 +200,27 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     var isSearchExpanded by remember { mutableStateOf(false) }
+    var hasAllFilesAccess by remember {
+        mutableStateOf(com.example.util.StorageAccessHelper.hasAllFilesAccess())
+    }
 
     LaunchedEffect(Unit) {
         viewModel.snackbarEvent.collect { message ->
             snackbarHostState.showSnackbar(message)
         }
+    }
+
+    // The permission can only be toggled from the system Settings screen, so re-check it
+    // whenever the user comes back to the app (e.g. right after granting/revoking it there).
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                hasAllFilesAccess = com.example.util.StorageAccessHelper.hasAllFilesAccess()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     Scaffold(
@@ -428,6 +486,7 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                             onPause = { viewModel.pauseDownload(download.id) },
                             onResume = { viewModel.resumeDownload(download.id) },
                             onRetry = { viewModel.retryDownload(download.id) },
+                            onCancelActive = { viewModel.cancelActiveDownload(download.id) },
                             onDelete = { viewModel.deleteDownload(download.id, deleteFile = true) },
                             onOpen = {
                                 val opened = FormatUtils.openDownloadedFile(context, download.filePath)
@@ -485,7 +544,11 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
             },
             onDelete = { deleteFile ->
                 viewModel.deleteDownload(download.id, deleteFile)
-            }
+            },
+            canMoveToPublicStorage = hasAllFilesAccess &&
+                    download.status == com.example.data.model.DownloadStatus.COMPLETED &&
+                    download.filePath.contains("/Android/data/"),
+            onMoveToPublicStorage = { viewModel.moveToPublicStorage(download.id) }
         )
     }
 
@@ -497,7 +560,9 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                 viewModel.setSmartEngineMode(mode)
             },
             onDismiss = { viewModel.setShowSettingsDialog(false) },
-            onClearCompleted = { viewModel.clearCompletedDownloads() }
+            onClearCompleted = { viewModel.clearCompletedDownloads() },
+            hasAllFilesAccess = hasAllFilesAccess,
+            onRequestStorageAccess = { com.example.util.StorageAccessHelper.requestAllFilesAccess(context) }
         )
     }
 }

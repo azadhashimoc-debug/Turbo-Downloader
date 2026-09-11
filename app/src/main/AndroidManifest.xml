@@ -5,6 +5,15 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Lets completed downloads be written into the real, publicly-browsable Downloads
+         folder instead of this app's hidden Android/data sandbox, which other apps
+         (archive managers, file browsers) cannot see on Android 11+. Only meaningful for
+         personal/sideloaded use - the Play Store restricts this permission to apps whose
+         core purpose is broad file management. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
 
     <application
         android:allowBackup="true"
@@ -33,6 +42,14 @@
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="text/plain" />
+            </intent-filter>
+
+            <!-- Public entry point for other apps you control (e.g. a custom browser) to
+                 hand off a download directly, with no chooser dialog. See EXTRA_URL /
+                 EXTRA_FILE_NAME in MainActivity.kt for the contract. -->
+            <intent-filter>
+                <action android:name="com.aistudio.downloadmanager.kxvt.action.ADD_DOWNLOAD" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
 
             <!-- Intercept direct file download links from browsers -->
@@ -66,6 +83,11 @@
                 <data android:pathPattern=".*\\.pptx" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".service.DownloadKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

@@ -35,6 +35,14 @@ class DownloadRepository(
         downloadEngine.resumeDownload(id)
     }
 
+    fun cancelActiveDownload(id: Long) {
+        downloadEngine.cancelActiveDownload(id)
+    }
+
+    fun moveToPublicStorage(id: Long, onResult: (Boolean) -> Unit) {
+        downloadEngine.moveToPublicStorage(id, onResult)
+    }
+
     fun retryDownload(id: Long) {
         downloadEngine.retryDownload(id)
     }

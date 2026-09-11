@@ -77,6 +77,7 @@ fun DownloadItemCard(
     onPause: () -> Unit,
     onResume: () -> Unit,
     onRetry: () -> Unit,
+    onCancelActive: () -> Unit,
     onDelete: () -> Unit,
     onOpen: () -> Unit,
     onShare: () -> Unit,
@@ -304,7 +305,7 @@ fun DownloadItemCard(
                                 )
                             }
                             IconButton(
-                                onClick = onDelete,
+                                onClick = onCancelActive,
                                 modifier = Modifier
                                     .minimumInteractiveComponentSize()
                                     .size(36.dp)
