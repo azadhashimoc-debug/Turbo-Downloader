@@ -6,7 +6,9 @@ import com.example.data.db.DownloadDao
 import com.example.data.model.DownloadCategory
 import com.example.data.model.DownloadEntity
 import com.example.data.model.DownloadStatus
+import com.example.service.DownloadKeepAliveService
 import com.example.util.FormatUtils
+import com.example.util.NotificationHelper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -65,10 +67,22 @@ class DownloadEngine(
     val liveSpeeds: StateFlow<Map<Long, Long>> = _liveSpeeds.asStateFlow()
 
     init {
+        NotificationHelper.ensureChannels(context)
         // Reset any leftover "DOWNLOADING" states from previous app session
         engineScope.launch {
             downloadDao.resetInterruptedDownloads()
         }
+    }
+
+    /**
+     * Keeps the persistent "downloads in progress" notification (and the foreground
+     * service backing it) in sync with how many jobs are actually running, so the
+     * process is protected from being killed while a download is active.
+     */
+    private fun refreshKeepAliveState() {
+        val activeCount = activeJobs.size
+        val totalSpeed = _liveSpeeds.value.values.sum()
+        DownloadKeepAliveService.updateState(context, activeCount, totalSpeed)
     }
 
     fun setEngineMode(mode: SmartEngineMode) {
@@ -122,6 +136,7 @@ class DownloadEngine(
             runSmartDownload(downloadId)
         }
         activeJobs[downloadId] = job
+        refreshKeepAliveState()
     }
 
     fun pauseDownload(downloadId: Long) {
@@ -132,6 +147,7 @@ class DownloadEngine(
         val updatedMap = _liveSpeeds.value.toMutableMap()
         updatedMap.remove(downloadId)
         _liveSpeeds.value = updatedMap
+        refreshKeepAliveState()
 
         engineScope.launch {
             val item = downloadDao.getDownloadByIdSync(downloadId) ?: return@launch
@@ -183,6 +199,7 @@ class DownloadEngine(
         val updatedMap = _liveSpeeds.value.toMutableMap()
         updatedMap.remove(downloadId)
         _liveSpeeds.value = updatedMap
+        refreshKeepAliveState()
 
         engineScope.launch {
             val item = downloadDao.getDownloadByIdSync(downloadId)
@@ -313,6 +330,10 @@ class DownloadEngine(
                 executeAdaptiveStreamDownload(downloadId, entity, targetFile, probedContentLength, isServerResumable)
             }
 
+            val finished = downloadDao.getDownloadByIdSync(downloadId)
+            if (finished != null && finished.status == DownloadStatus.COMPLETED) {
+                NotificationHelper.notifyCompleted(context, finished)
+            }
         } catch (e: CancellationException) {
             val current = downloadDao.getDownloadByIdSync(downloadId)
             if (current != null && current.status != DownloadStatus.COMPLETED) {
@@ -327,19 +348,20 @@ class DownloadEngine(
             e.printStackTrace()
             val current = downloadDao.getDownloadByIdSync(downloadId)
             if (current != null) {
-                downloadDao.updateDownload(
-                    current.copy(
-                        status = DownloadStatus.FAILED,
-                        errorMessage = e.localizedMessage ?: "Yükləmə xətası baş verdi",
-                        speedBytesPerSec = 0
-                    )
+                val failed = current.copy(
+                    status = DownloadStatus.FAILED,
+                    errorMessage = e.localizedMessage ?: "Yükləmə xətası baş verdi",
+                    speedBytesPerSec = 0
                 )
+                downloadDao.updateDownload(failed)
+                NotificationHelper.notifyFailed(context, failed)
             }
         } finally {
             activeJobs.remove(downloadId)
             val speedMap = _liveSpeeds.value.toMutableMap()
             speedMap.remove(downloadId)
             _liveSpeeds.value = speedMap
+            refreshKeepAliveState()
         }
     }
 
