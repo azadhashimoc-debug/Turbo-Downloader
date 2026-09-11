@@ -200,11 +200,27 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     var isSearchExpanded by remember { mutableStateOf(false) }
+    var hasAllFilesAccess by remember {
+        mutableStateOf(com.example.util.StorageAccessHelper.hasAllFilesAccess())
+    }
 
     LaunchedEffect(Unit) {
         viewModel.snackbarEvent.collect { message ->
             snackbarHostState.showSnackbar(message)
         }
+    }
+
+    // The permission can only be toggled from the system Settings screen, so re-check it
+    // whenever the user comes back to the app (e.g. right after granting/revoking it there).
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                hasAllFilesAccess = com.example.util.StorageAccessHelper.hasAllFilesAccess()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     Scaffold(
@@ -540,7 +556,9 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                 viewModel.setSmartEngineMode(mode)
             },
             onDismiss = { viewModel.setShowSettingsDialog(false) },
-            onClearCompleted = { viewModel.clearCompletedDownloads() }
+            onClearCompleted = { viewModel.clearCompletedDownloads() },
+            hasAllFilesAccess = hasAllFilesAccess,
+            onRequestStorageAccess = { com.example.util.StorageAccessHelper.requestAllFilesAccess(context) }
         )
     }
 }

@@ -98,13 +98,29 @@ class DownloadEngine(
         _engineMode.value = mode
     }
 
+    /**
+     * When "All files access" has been granted, downloads go into the real, publicly
+     * browsable Downloads folder (visible to any file manager or archive app). Without it,
+     * fall back to this app's own sandboxed external-files dir, which - since Android 11 -
+     * no other app (zArchiver included) can browse into at all, even though the OS still
+     * lets us read/write it ourselves.
+     */
     private fun getDownloadsDirectory(): File {
-        val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-            ?: File(context.filesDir, "Downloads")
+        val dir = if (hasAllFilesAccess()) {
+            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "TurboLoad")
+        } else {
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                ?: File(context.filesDir, "Downloads")
+        }
         if (!dir.exists()) {
             dir.mkdirs()
         }
         return dir
+    }
+
+    private fun hasAllFilesAccess(): Boolean {
+        return android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R &&
+                Environment.isExternalStorageManager()
     }
 
     suspend fun enqueueDownload(
