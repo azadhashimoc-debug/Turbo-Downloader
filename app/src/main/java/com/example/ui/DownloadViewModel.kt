@@ -246,6 +246,13 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
         repository.resumeDownload(id)
     }
 
+    fun cancelActiveDownload(id: Long) {
+        repository.cancelActiveDownload(id)
+        viewModelScope.launch {
+            _snackbarEvent.emit("Yükləmə ləğv edildi")
+        }
+    }
+
     fun retryDownload(id: Long) {
         repository.retryDownload(id)
     }

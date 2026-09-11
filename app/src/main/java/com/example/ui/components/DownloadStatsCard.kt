@@ -250,7 +250,11 @@ fun DownloadStatsCard(
                                     color = Color.White
                                 )
                                 Text(
-                                    text = "4-axınlı turbo • dinamik bufer",
+                                    text = if (engineMode.streamCount > 1) {
+                                        "${engineMode.streamCount}-axınlı paralel • dinamik bufer"
+                                    } else {
+                                        "Tək axın • qırılmaya davamlı"
+                                    },
                                     style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                                     color = Color(0xFF94A3B8)
                                 )

@@ -68,9 +68,18 @@ class DownloadEngine(
 
     init {
         NotificationHelper.ensureChannels(context)
-        // Reset any leftover "DOWNLOADING" states from previous app session
+        // Reset any leftover "DOWNLOADING"/"CONNECTING" states from a previous app session
+        // that was killed mid-download - otherwise those items would stay stuck showing a
+        // spinner forever, with no coroutine left running to ever finish them.
         engineScope.launch {
-            downloadDao.resetInterruptedDownloads()
+            downloadDao.resetInterruptedDownloads(
+                oldStatus = DownloadStatus.DOWNLOADING,
+                newStatus = DownloadStatus.PAUSED
+            )
+            downloadDao.resetInterruptedDownloads(
+                oldStatus = DownloadStatus.CONNECTING,
+                newStatus = DownloadStatus.PAUSED
+            )
         }
     }
 
@@ -166,6 +175,45 @@ class DownloadEngine(
         startDownload(downloadId)
     }
 
+    /**
+     * Cancels an in-progress download but - unlike [cancelDownload] - keeps its row so it
+     * shows up as CANCELLED (retryable from the list), instead of vanishing entirely. This
+     * is what the UI's "cancel" (X) action on an active download actually calls; the trash
+     * icon on a finished/failed/cancelled item still uses [cancelDownload] to remove it
+     * for good.
+     */
+    fun cancelActiveDownload(downloadId: Long) {
+        pausedFlags[downloadId] = true
+        activeJobs[downloadId]?.cancel()
+        activeJobs.remove(downloadId)
+
+        val updatedMap = _liveSpeeds.value.toMutableMap()
+        updatedMap.remove(downloadId)
+        _liveSpeeds.value = updatedMap
+        refreshKeepAliveState()
+
+        engineScope.launch {
+            val item = downloadDao.getDownloadByIdSync(downloadId) ?: return@launch
+            if (item.status == DownloadStatus.COMPLETED) return@launch
+
+            try {
+                val file = File(item.filePath)
+                if (file.exists()) file.delete()
+                cleanPartFiles(file)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+
+            downloadDao.updateDownload(
+                item.copy(
+                    status = DownloadStatus.CANCELLED,
+                    downloadedBytes = 0L,
+                    speedBytesPerSec = 0
+                )
+            )
+        }
+    }
+
     fun retryDownload(downloadId: Long) {
         pauseDownload(downloadId)
         engineScope.launch {
@@ -217,6 +265,12 @@ class DownloadEngine(
             }
         }
     }
+
+    /**
+     * Each [SmartEngineMode] genuinely changes how the download runs, not just its label -
+     * see [SmartEngineMode.streamCount] for the canonical per-mode stream count.
+     */
+    private fun numThreadsForMode(mode: SmartEngineMode): Int = mode.streamCount
 
     /** Removes the small per-segment resume-progress marker files (see [executeMultiStreamDownload]). */
     private fun cleanPartFiles(file: File) {
@@ -305,13 +359,15 @@ class DownloadEngine(
                 }
             }
 
-            // Determine if multi-threaded chunking is beneficial
+            // Determine if multi-threaded chunking is beneficial, and how many streams
+            // this mode actually uses - each mode genuinely behaves differently now.
             val currentMode = _engineMode.value
+            val numThreads = numThreadsForMode(currentMode)
             val isLargeFile = probedContentLength > 2 * 1024 * 1024 // > 2MB
             val canUseMultiStream = isServerResumable &&
                     probedContentLength > 0 &&
                     isLargeFile &&
-                    currentMode == SmartEngineMode.TURBO_MULTI_STREAM
+                    numThreads > 1
 
             val finalFileName = probedFileName
             entity = entity.copy(
@@ -324,11 +380,11 @@ class DownloadEngine(
             downloadDao.updateDownload(entity)
 
             if (canUseMultiStream) {
-                // Turbo 4-stream segmented download for weak connections
-                executeMultiStreamDownload(downloadId, entity, targetFile, probedContentLength)
+                // Segmented download across `numThreads` parallel HTTP Range streams
+                executeMultiStreamDownload(downloadId, entity, targetFile, probedContentLength, numThreads, currentMode)
             } else {
                 // Adaptive single-stream with dynamic buffer and auto-reconnect
-                executeAdaptiveStreamDownload(downloadId, entity, targetFile, probedContentLength, isServerResumable)
+                executeAdaptiveStreamDownload(downloadId, entity, targetFile, probedContentLength, isServerResumable, currentMode)
             }
 
             val finished = downloadDao.getDownloadByIdSync(downloadId)
@@ -368,17 +424,18 @@ class DownloadEngine(
 
     /**
      * Smart Segmented Multi-Stream Downloader:
-     * Splits file into 4 parallel chunks. Weak and throttled connections benefit immensely
-     * because servers often throttle per-connection bandwidth, but 4 concurrent connections
-     * bypass single-stream limits and maximize link utilization.
+     * Splits the file into [numThreads] parallel chunks. Weak and throttled connections
+     * benefit immensely because servers often throttle per-connection bandwidth, but several
+     * concurrent connections bypass single-stream limits and maximize link utilization.
      */
     private suspend fun executeMultiStreamDownload(
         downloadId: Long,
         initialEntity: DownloadEntity,
         targetFile: File,
-        totalBytes: Long
+        totalBytes: Long,
+        numThreads: Int,
+        mode: SmartEngineMode
     ) = withContext(Dispatchers.IO) {
-        val numThreads = 4
         val chunkSize = totalBytes / numThreads
 
         // Allocate target file space if not already allocated
@@ -442,7 +499,7 @@ class DownloadEngine(
                             }
 
                             val body = response.body ?: throw Exception("Chunk body null")
-                            val bufferSize = calculateOptimalBuffer(currentSpeed)
+                            val bufferSize = calculateOptimalBuffer(currentSpeed, mode)
                             val buffer = ByteArray(bufferSize)
 
                             raf.seek(segmentCurrent)
@@ -489,7 +546,7 @@ class DownloadEngine(
                         } catch (e: Exception) {
                             if (pausedFlags.getOrDefault(downloadId, false)) break
                             retryCount++
-                            if (retryCount > 5) {
+                            if (retryCount > maxRetriesForMode(mode)) {
                                 throw e
                             }
                             delay(1000L * retryCount) // Smart exponential backoff on weak link
@@ -557,7 +614,8 @@ class DownloadEngine(
         initialEntity: DownloadEntity,
         targetFile: File,
         totalBytes: Long,
-        isResumable: Boolean
+        isResumable: Boolean,
+        mode: SmartEngineMode
     ) = withContext(Dispatchers.IO) {
         var existingLength = if (targetFile.exists()) targetFile.length() else 0L
         var currentDownloaded = existingLength
@@ -600,7 +658,7 @@ class DownloadEngine(
                 val stream = body.byteStream()
                 val fos = FileOutputStream(targetFile, append)
 
-                val bufferSize = calculateOptimalBuffer(currentSpeed)
+                val bufferSize = calculateOptimalBuffer(currentSpeed, mode)
                 val buffer = ByteArray(bufferSize)
 
                 fos.use { output ->
@@ -649,7 +707,7 @@ class DownloadEngine(
             } catch (e: Exception) {
                 if (pausedFlags.getOrDefault(downloadId, false)) break
                 retryCount++
-                if (retryCount > 6) {
+                if (retryCount > maxRetriesForMode(mode)) {
                     throw e
                 }
                 delay(1200L * retryCount) // Smart auto-retry on weak internet connection drops
@@ -685,14 +743,30 @@ class DownloadEngine(
      * Slow networks (< 256 KB/s): 16 KB for low latency and rapid packet flushing
      * Medium networks: 32 KB - 64 KB
      * Fast networks: 128 KB for peak OS system call efficiency
+     *
+     * LOW_LATENCY_ECO caps the buffer at 32 KB regardless of measured speed - smaller
+     * writes flush to disk more often, so a connection that drops mid-buffer loses less
+     * progress, matching what that mode promises ("small buffers against interruption").
      */
-    private fun calculateOptimalBuffer(speedBytesPerSec: Long): Int {
-        return when {
+    private fun calculateOptimalBuffer(speedBytesPerSec: Long, mode: SmartEngineMode): Int {
+        val uncapped = when {
             speedBytesPerSec < 256 * 1024 -> 16 * 1024
             speedBytesPerSec < 1024 * 1024 -> 32 * 1024
             speedBytesPerSec < 5 * 1024 * 1024 -> 64 * 1024
             else -> 128 * 1024
         }
+        val cap = if (mode == SmartEngineMode.LOW_LATENCY_ECO) 32 * 1024 else Int.MAX_VALUE
+        return uncapped.coerceAtMost(cap)
+    }
+
+    /**
+     * LOW_LATENCY_ECO tolerates more consecutive drops before giving up, matching its
+     * "resilient against a flaky connection" description; the other modes fail a bit
+     * faster since they assume a more usable link.
+     */
+    private fun maxRetriesForMode(mode: SmartEngineMode): Int = when (mode) {
+        SmartEngineMode.LOW_LATENCY_ECO -> 10
+        else -> 6
     }
 
     private fun sanitizeFileName(name: String): String {

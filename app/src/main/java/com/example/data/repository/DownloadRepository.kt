@@ -35,6 +35,10 @@ class DownloadRepository(
         downloadEngine.resumeDownload(id)
     }
 
+    fun cancelActiveDownload(id: Long) {
+        downloadEngine.cancelActiveDownload(id)
+    }
+
     fun retryDownload(id: Long) {
         downloadEngine.retryDownload(id)
     }

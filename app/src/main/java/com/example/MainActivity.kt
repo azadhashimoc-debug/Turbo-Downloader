@@ -443,6 +443,7 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                             onPause = { viewModel.pauseDownload(download.id) },
                             onResume = { viewModel.resumeDownload(download.id) },
                             onRetry = { viewModel.retryDownload(download.id) },
+                            onCancelActive = { viewModel.cancelActiveDownload(download.id) },
                             onDelete = { viewModel.deleteDownload(download.id, deleteFile = true) },
                             onOpen = {
                                 val opened = FormatUtils.openDownloadedFile(context, download.filePath)
