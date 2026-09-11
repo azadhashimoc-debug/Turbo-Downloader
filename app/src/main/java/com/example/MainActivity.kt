@@ -96,6 +96,25 @@ import com.example.util.FormatUtils
 
 class MainActivity : ComponentActivity() {
 
+    companion object {
+        /**
+         * Public contract for another app you control (e.g. a custom browser) to hand off
+         * a download directly - no chooser dialog, no relying on the system intercepting a
+         * link the way Chrome never does. Send an explicit intent:
+         *
+         * ```
+         * Intent(ACTION_ADD_DOWNLOAD).apply {
+         *     setPackage("com.aistudio.downloadmanager.kxvt")
+         *     putExtra(EXTRA_URL, url)                 // required
+         *     putExtra(EXTRA_FILE_NAME, suggestedName)  // optional
+         * }.let(context::startActivity)
+         * ```
+         */
+        const val ACTION_ADD_DOWNLOAD = "com.aistudio.downloadmanager.kxvt.action.ADD_DOWNLOAD"
+        const val EXTRA_URL = "extra_url"
+        const val EXTRA_FILE_NAME = "extra_file_name"
+    }
+
     private val viewModel: DownloadViewModel by viewModels()
 
     private val notificationPermissionLauncher =
@@ -137,6 +156,14 @@ class MainActivity : ComponentActivity() {
         if (intent == null) return
 
         when (intent.action) {
+            ACTION_ADD_DOWNLOAD -> {
+                val url = intent.getStringExtra(EXTRA_URL)?.trim()
+                if (!url.isNullOrBlank() && (url.startsWith("http://") || url.startsWith("https://"))) {
+                    val fileName = intent.getStringExtra(EXTRA_FILE_NAME)?.trim()
+                    // Trusted first-party caller - start immediately, no confirmation dialog.
+                    viewModel.startDownload(url, fileName)
+                }
+            }
             Intent.ACTION_VIEW -> {
                 val dataUri = intent.dataString
                 if (!dataUri.isNullOrBlank() && (dataUri.startsWith("http://") || dataUri.startsWith("https://"))) {

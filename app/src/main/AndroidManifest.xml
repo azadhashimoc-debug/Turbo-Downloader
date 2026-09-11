@@ -37,6 +37,14 @@
                 <data android:mimeType="text/plain" />
             </intent-filter>
 
+            <!-- Public entry point for other apps you control (e.g. a custom browser) to
+                 hand off a download directly, with no chooser dialog. See EXTRA_URL /
+                 EXTRA_FILE_NAME in MainActivity.kt for the contract. -->
+            <intent-filter>
+                <action android:name="com.aistudio.downloadmanager.kxvt.action.ADD_DOWNLOAD" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+
             <!-- Intercept direct file download links from browsers -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
