@@ -1,0 +1,6 @@
+{
+  "name": "Download Manager",
+  "description": "Android üçün sürətli və güclü İnternet Yükləmə Meneceri (Internet Download Manager). Fasilə və davam etdirmə, sürət izləmə və fayl idarəetməsi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

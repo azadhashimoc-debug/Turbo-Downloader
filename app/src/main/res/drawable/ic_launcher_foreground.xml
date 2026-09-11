@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Subtle drop shadow -->
+    <path
+        android:fillColor="#50000000"
+        android:pathData="M54,26 L73,45 L62,45 L62,65 L46,65 L46,45 L35,45 Z" />
+    
+    <!-- Neon Kinetic Base Cradle -->
+    <path
+        android:fillColor="#151F32"
+        android:strokeColor="#00F0FF"
+        android:strokeWidth="1.5"
+        android:pathData="M28,68 L34,68 L38,73 L70,73 L74,68 L80,68 C82.2,68 84,69.8 84,72 L84,76 C84,78.2 82.2,80 80,80 L28,80 C25.8,80 24,78.2 24,76 L24,72 C24,69.8 25.8,68 28,68 Z" />
+
+    <!-- Turbo Down Arrow with Electric Cyan Gradient -->
+    <path
+        android:pathData="M54,23 L72,43 L60,43 L60,63 L48,63 L48,43 L36,43 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54"
+                android:startY="23"
+                android:endX="54"
+                android:endY="63"
+                android:type="linear">
+                <item android:color="#FFFFFF" android:offset="0.0" />
+                <item android:color="#70F8FF" android:offset="0.4" />
+                <item android:color="#00F0FF" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Kinetic Turbo Spark -->
+    <path
+        android:fillColor="#FF9E00"
+        android:pathData="M51,33 L57,33 L53,42 L58,42 L49,55 L52,45 L47,45 Z" />
+
+    <!-- High-Velocity Progress Track Line -->
+    <path
+        android:fillColor="#00F0FF"
+        android:pathData="M44,76 L64,76 A2,2 0 0,0 64,73 L44,73 A2,2 0 0,0 44,76 Z" />
+</vector>
