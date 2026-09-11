@@ -99,6 +99,66 @@ class DownloadEngine(
     }
 
     /**
+     * Moves an already-completed download out of this app's hidden sandbox folder into the
+     * public Downloads/TurboLoad folder, so other apps (archive managers, file browsers) can
+     * finally see it - without re-downloading it. Only this app can reach its own sandbox
+     * folder, so this has to happen from inside it. Same-volume moves are an instant rename,
+     * not a byte-for-byte copy, so this is safe even for very large files.
+     */
+    fun moveToPublicStorage(downloadId: Long, onResult: (Boolean) -> Unit = {}) {
+        engineScope.launch {
+            if (!hasAllFilesAccess()) {
+                onResult(false)
+                return@launch
+            }
+            val item = downloadDao.getDownloadByIdSync(downloadId)
+            if (item == null || item.status != DownloadStatus.COMPLETED) {
+                onResult(false)
+                return@launch
+            }
+            val source = File(item.filePath)
+            if (!source.exists()) {
+                onResult(false)
+                return@launch
+            }
+
+            val publicDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "TurboLoad")
+            if (!publicDir.exists()) publicDir.mkdirs()
+
+            if (source.parentFile?.absolutePath == publicDir.absolutePath) {
+                onResult(true) // Already there
+                return@launch
+            }
+
+            val dest = getUniqueFile(publicDir, source.name)
+            val success = try {
+                if (source.renameTo(dest)) {
+                    true
+                } else {
+                    // Cross-filesystem fallback (e.g. source on an SD card): copy, then
+                    // delete the original once the copy is verified complete.
+                    source.copyTo(dest, overwrite = false)
+                    if (dest.length() == source.length()) {
+                        source.delete()
+                        true
+                    } else {
+                        dest.delete()
+                        false
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                false
+            }
+
+            if (success) {
+                downloadDao.updateDownload(item.copy(filePath = dest.absolutePath))
+            }
+            onResult(success)
+        }
+    }
+
+    /**
      * When "All files access" has been granted, downloads go into the real, publicly
      * browsable Downloads folder (visible to any file manager or archive app). Without it,
      * fall back to this app's own sandboxed external-files dir, which - since Android 11 -

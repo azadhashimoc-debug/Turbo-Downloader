@@ -64,7 +64,9 @@ fun DownloadDetailsDialog(
     onDismiss: () -> Unit,
     onOpen: () -> Unit,
     onShare: () -> Unit,
-    onDelete: (deleteFile: Boolean) -> Unit
+    onDelete: (deleteFile: Boolean) -> Unit,
+    canMoveToPublicStorage: Boolean = false,
+    onMoveToPublicStorage: () -> Unit = {}
 ) {
     val context = LocalContext.current
 
@@ -164,6 +166,27 @@ fun DownloadDetailsDialog(
                             modifier = Modifier.padding(10.dp),
                             color = Color(0xFFE2E8F0)
                         )
+                    }
+
+                    if (canMoveToPublicStorage) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Bu qovluğu digər proqramlar (zArchiver və s.) görə bilmir.",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = TurboAmber
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        OutlinedButton(
+                            onClick = onMoveToPublicStorage,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.5f)),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = ElectricCyan)
+                        ) {
+                            Icon(imageVector = Icons.Default.Launch, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Downloads qovluğuna köçür")
+                        }
                     }
                 }
 

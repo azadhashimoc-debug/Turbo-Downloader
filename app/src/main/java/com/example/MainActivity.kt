@@ -544,7 +544,11 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
             },
             onDelete = { deleteFile ->
                 viewModel.deleteDownload(download.id, deleteFile)
-            }
+            },
+            canMoveToPublicStorage = hasAllFilesAccess &&
+                    download.status == com.example.data.model.DownloadStatus.COMPLETED &&
+                    download.filePath.contains("/Android/data/"),
+            onMoveToPublicStorage = { viewModel.moveToPublicStorage(download.id) }
         )
     }
 
